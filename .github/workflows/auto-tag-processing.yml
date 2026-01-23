@@ -1,0 +1,118 @@
+name: Auto Tag Processing
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  contents: write # リポジトリにタグをプッシュするために必要
+
+jobs:
+  tag-processing:
+    # PRがmainにマージされた場合にトリガー
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describeを実行するためにすべての履歴を取得
+
+      - name: Process Labels and Tag
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels) }}
+        run: |
+          python3 -c "
+          import os
+          import json
+          import subprocess
+          import sys
+
+          # PRラベルを取得
+          labels_json = os.environ.get('PR_LABELS', '[]')
+          try:
+              labels = json.loads(labels_json)
+          except:
+              labels = []
+
+          label_names = [l['name'] for l in labels]
+          bump_type = None
+
+          # ラベルを走査
+          # ロジック: release:major, release:minor, release:patch を確認
+          # 優先順位: major > minor > patch
+          if 'release:major' in label_names:
+              bump_type = 'major'
+          elif 'release:minor' in label_names:
+              bump_type = 'minor'
+          elif 'release:patch' in label_names:
+              bump_type = 'patch'
+
+          # 一致するラベルがない場合は終了
+          if not bump_type:
+              print('No release label found (release:major, release:minor, release:patch). Exiting.')
+              sys.exit(0)
+
+          print(f'Bump type detected: {bump_type}')
+
+          # 最新のタグを取得
+          # git describe --tags --abbrev=0: 現在のコミットから履歴を遡り、到達可能な最も近いタグを取得します
+          try:
+              latest_tag = subprocess.check_output(['git', 'describe', '--tags', '--abbrev=0'], stderr=subprocess.DEVNULL).decode().strip()
+          except:
+              latest_tag = 'v0.0.0'
+
+          print(f'Latest tag: {latest_tag}')
+
+          # バージョン vX.Y.Z を解析
+          if latest_tag.startswith('v'):
+              version_str = latest_tag[1:]
+          else:
+              version_str = latest_tag
+
+          parts = version_str.split('.')
+          # X.Y.Z形式を保証
+          while len(parts) < 3:
+              parts.append('0')
+
+          try:
+              major = int(parts[0])
+              minor = int(parts[1])
+              patch = int(parts[2])
+          except ValueError:
+              print(f'Error: Could not parse version numbers from tag {latest_tag}')
+              sys.exit(1)
+
+          # セマンティック バージョニング (SemVer) ロジックを適用
+          # release:major -> v(X+1).0.0 (下位バージョンは0にリセット)
+          # release:minor -> vX.(Y+1).0 (下位バージョンは0にリセット)
+          # release:patch -> vX.Y.(Z+1)
+          if bump_type == 'major':
+              major += 1
+              minor = 0
+              patch = 0
+          elif bump_type == 'minor':
+              minor += 1
+              patch = 0
+          elif bump_type == 'patch':
+              patch += 1
+
+          new_tag = f'v{major}.{minor}.{patch}'
+          print(f'New tag: {new_tag}')
+
+          # プッシュ用にgitを設定
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
+
+          # 新しいタグをプッシュ
+          try:
+              subprocess.run(['git', 'tag', new_tag], check=True)
+              subprocess.run(['git', 'push', 'origin', new_tag], check=True)
+              print(f'Successfully pushed tag {new_tag}')
+          except subprocess.CalledProcessError as e:
+              print(f'Failed to push tag: {e}')
+              sys.exit(1)
+          "

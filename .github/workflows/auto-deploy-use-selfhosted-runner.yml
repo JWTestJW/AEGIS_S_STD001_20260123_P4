@@ -1,0 +1,201 @@
+# ================================================
+#  機能概要
+# -----------------------------------------------
+#  このワークフローは、Self-Hosted ランナーを使用し、
+#  新しいTagが作成された際に、リポジトリの資材をデプロイします。
+#
+#  実行条件：
+#  1. 自動実行（Auto Tag Processing 完了時）
+#     - "Auto Tag Processing" ワークフローが成功した場合にトリガーされます。
+#     - トリガーとなったコミットにタグが付与されているかを確認します（git tag --points-at）。
+#       タグが存在する場合のみ、そのタグ（バージョン）の資材をデプロイします。
+#       タグが存在しない場合（例：ラベル不一致によりタグ作成がスキップされた場合）はデプロイを行いません。
+#  2. 手動実行（workflow_dispatch）
+#     - ユーザーが選択したブランチまたはタグの資材をデプロイします。
+#     - タグの自動取得ロジックはスキップされます。
+#
+#  主な機能：
+#  - 東京時間の日時（ミリ秒まで）を含むフォルダを作成（例: Deploy_20251223123000123）
+#  - 必要なソースコードやファイルのコピー
+#  - rsync を使用してローカルモードでマウントポイントへ
+#  - デプロイ完了後、checkoutDir を削除してクリーンアップ
+#  - secrets.MOUNT_TARGET_DIR が設定されていない場合はデプロイをスキップし、警告を表示
+# ================================================
+
+name: Auto Deploy (Self-Hosted)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["Auto Tag Processing"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    # workflow_run の場合は成功時のみ実行。手動実行も許可。
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Self-Hosted ランナーを指定（ラベルは環境に合わせて調整してください）
+    runs-on: [self-hosted, linux]
+
+    env:
+      MOUNT_TARGET_DIR: ${{ secrets.MOUNT_TARGET_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 最新のTagを取得するために全履歴が必要
+          path: checkoutDir
+
+      - name: Log and Checkout Latest Tag
+        working-directory: checkoutDir
+        run: |
+          DO_DEPLOY="true"
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Using the selected ref: $GITHUB_REF"
+            # 手動トリガーの場合は actions/checkout が既に選択されたブランチ/タグをチェックアウトしている
+          else
+            # workflow_run トリガーの場合、mainブランチがチェックアウトされているため、
+            # 対象のタグを探してチェックアウトし直す
+            echo "Workflow triggered by auto-tag-processing completion."
+            
+            # 1. トリガーとなったコミットSHAを取得 (Auto Tag Processing実行時のHEAD)
+            TRIGGER_COMMIT="${{ github.event.workflow_run.head_sha }}"
+            
+            # 2. このコミットを指すタグがあるか確認 (points-at)
+            # 注意：1つのコミットに複数のタグがある可能性もありますが、デプロイにはそのうちの1つを使用します
+            TAGS_ON_COMMIT=$(git tag --points-at "$TRIGGER_COMMIT")
+
+            if [ -z "$TAGS_ON_COMMIT" ]; then
+                # タグが見つからない場合（タグ作成がスキップされた場合など）
+                echo "::notice::Skipping deployment. No tags found pointing to commit $TRIGGER_COMMIT."
+                DO_DEPLOY="false"
+            else
+                # タグが見つかった場合
+                # 複数タグがある場合は最初のものを採用
+                LATEST_TAG=$(echo "$TAGS_ON_COMMIT" | head -n 1)
+                
+                echo "Found tag(s) on commit: $TAGS_ON_COMMIT"
+                echo "Deploying target tag: $LATEST_TAG"
+
+                git checkout $LATEST_TAG
+                DO_DEPLOY="true"
+            fi
+          fi
+
+          echo "DO_DEPLOY=$DO_DEPLOY" >> $GITHUB_ENV
+
+      - name: Prepare and Copy to Mount Point
+        env:
+          TZ: "Asia/Tokyo" # タイムゾーンを東京に設定
+        # マウント先が設定されている場合 かつ デプロイ有効時に実行
+        if: env.MOUNT_TARGET_DIR != '' && env.DO_DEPLOY == 'true'
+        run: |
+          # 日時付きディレクトリ名の生成 (例: Deploy_20251223153000123)
+          TIMESTAMP=$(date +'%Y%m%d%H%M%S%3N')
+          DEPLOY_DIR="Deploy_$TIMESTAMP"
+
+          echo "Creating deployment directory: $DEPLOY_DIR"
+          mkdir -p "$DEPLOY_DIR"
+
+          # src フォルダのコピー（存在する場合のみ）
+          if [ -d "checkoutDir/src" ]; then
+            echo "Copying src..."
+            cp -r "checkoutDir/src" "$DEPLOY_DIR/"
+          else
+            echo "Info: src folder not found in checkoutDir, skipping."
+          fi
+
+          # test.R ファイルのコピー（存在する場合のみ）
+          if [ -f "checkoutDir/test.R" ]; then
+            echo "Copying test.R..."
+            cp "checkoutDir/test.R" "$DEPLOY_DIR/"
+          else
+            echo "Info: test.R file not found in checkoutDir, skipping."
+          fi
+
+          echo "----------------------------------------"
+          echo "Content of $DEPLOY_DIR:"
+          ls -R "$DEPLOY_DIR"
+          echo "----------------------------------------"
+
+          # マウントポイントの存在確認
+          if [ ! -d "$MOUNT_TARGET_DIR" ]; then
+            echo "Error: Target directory '$MOUNT_TARGET_DIR' does not exist or is not mounted."
+            exit 1
+          fi
+
+          # ログファイル定義
+          LOG_FILE="deploy_report.log"
+          START_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+
+          echo "========================================" > "$LOG_FILE"
+          echo "Deployment Report" >> "$LOG_FILE"
+          echo "Start Time: $START_TIME" >> "$LOG_FILE"
+          echo "Target: $MOUNT_TARGET_DIR/$DEPLOY_DIR" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+
+          echo "Starting Local Copy to $MOUNT_TARGET_DIR..."
+
+          # 【検証1】転送元のファイル数をカウント
+          SRC_COUNT=$(find "$DEPLOY_DIR" -type f | wc -l)
+          echo "Source File Count: $SRC_COUNT" >> "$LOG_FILE"
+
+          # rsync をローカルモードで使用してコピー
+          # -a: アーカイブモード（権限維持）
+          # -v: 詳細表示
+          # -c: チェックサムを行う（重要：ファイル内容で比較するため信頼性が高いが時間はかかる）
+          # --stats: 転送結果の統計情報を表示
+          # SSHオプション (-e) は指定しない
+          # ログを追記モードで保存
+          echo "[RSYNC OUTPUT]" >> "$LOG_FILE"
+          rsync -avc --stats "$DEPLOY_DIR" "$MOUNT_TARGET_DIR/" >> "$LOG_FILE" 2>&1
+          RSYNC_EXIT_CODE=$?
+
+          if [ $RSYNC_EXIT_CODE -ne 0 ]; then
+             echo "Error: rsync failed with exit code $RSYNC_EXIT_CODE" | tee -a "$LOG_FILE"
+             exit 1
+          fi
+            
+          # 【検証2】転送先のファイル数をカウント（再帰的に検索して比較）
+          # rsyncはディレクトリごとコピーしているため、パスを結合して確認
+          DEST_PATH="$MOUNT_TARGET_DIR/$DEPLOY_DIR"
+          DEST_COUNT=$(find "$DEST_PATH" -type f | wc -l)
+
+          echo "----------------------------------------" >> "$LOG_FILE"
+          echo "Destination File Count: $DEST_COUNT" >> "$LOG_FILE"
+
+          # 整合性チェック
+          if [ "$SRC_COUNT" -eq "$DEST_COUNT" ]; then
+             echo "Result: SUCCESS (File counts match)" >> "$LOG_FILE"
+          else
+             echo "Result: FAILURE (Count mismatch! Source: $SRC_COUNT vs Dest: $DEST_COUNT)" >> "$LOG_FILE"
+             # 失敗した場合、コンソールにも出してエラー終了させる
+             cat "$LOG_FILE"
+             exit 1
+          fi
+
+          END_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "End Time: $END_TIME" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+
+          echo "Deployment completed successfully."
+
+          # ログの内容をコンソールに出力して確認可能にする
+          cat "$LOG_FILE"
+
+          # checkouDirの清掃
+          echo "Cleaning up checkoutDir..."
+          rm -rf checkoutDir
+          # 必要であればログファイルも削除、あるいはアーティファクトとして残すことも可能
+          rm "$LOG_FILE"
+
+      - name: Warning if secrets are missing
+        if: success() && env.MOUNT_TARGET_DIR == '' && env.DO_DEPLOY == 'true'
+        run: |
+          echo "::warning::Skipped deployment because required secret is missing (MOUNT_TARGET_DIR)."
